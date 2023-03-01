@@ -2,11 +2,14 @@
 
 module Data.Python.Pickle.Class where
 
+import Control.Applicative(liftA2)
+import Control.Monad((=<<))
 import Control.Monad.ST.Trans(STT, newSTRef, readSTRef, runSTT)
-import Control.Monad.Trans.Class(lift)
+import Control.Monad.Trans.Class(MonadTrans, lift)
 import Control.Monad.Trans.State.Strict(StateT, evalStateT, get, gets, modify, put)
 
 import Data.Binary(Get, Put, getWord8, putWord8)
+import Data.Either(either)
 import Data.List.NonEmpty(NonEmpty((:|)), (<|))
 import qualified Data.List.NonEmpty as NE
 import Data.Maybe(listToMaybe)
@@ -14,90 +17,98 @@ import Data.STRef(STRef)
 import Data.Typeable(Typeable, typeOf)
 import Data.Word(Word8)
 
-data PyIObj
-  = PyINone
-  | PyITup [PyIObj]
-  | PyIDict [(PyIObj, PyIObj)]
-  | PyIList [PyIObj]
-  | PyIBool Bool
+traverse2 :: Applicative f => (a -> f b) -> (a, a) -> f (b, b)
+traverse2 f (x1, x2) = liftA2 (,) (f x1) (f x2)
+
+data PyObj
+  = PyNone
+  | PyTup [PyObj]
+  | PyDict [(PyObj, PyObj)]
+  | PyList [PyObj]
+  | PyBool Bool
   deriving (Eq, Show)
 
--- Immutable PyObjects
-data PyObj s
-  = PyNone
-  | PyTup [PyObj s]
-  | PyRef (PyData s)
-  | PyBool Bool
+-- Immutable PyMObjects
+data PyMObj s
+  = PyMNone
+  | PyMTup (Mack s)
+  | PyMRef (PyMData s)
+  | PyMBool Bool
   deriving Eq
 
 -- data that should be multable
 -- list items are in revserse to
 -- implement fast appends, which are
--- prepends in PyData'
-data PyData' s
-  = PyDict [(PyObj s, PyObj s)]
-  | PyList [PyObj s]
+-- prepends in PyMData'
+data PyMData' s
+  = PyMDict (PyKvps s)
+  | PyMList (Mack s)
   deriving Eq
 
-type PyData s = STRef s (PyData' s)
+type PyMData s = STRef s (PyMData' s)
+type Mack s = [PyMObj s]
+type PyKvp s = (PyMObj s, PyMObj s)
+type PyKvps s = [PyKvp s]
+type Stack s = NonEmpty (Mack s)
 
-freezePy :: Monad m => PyObj s -> STT s m PyIObj
-freezePy PyNone = pure PyINone
-freezePy (PyTup o) = PyITup <$> (traverse freezePy o)
-freezePy (PyRef r) = readSTRef r >>= freezePy'
-freezePy (PyBool b) = pure (PyIBool b)
+freezePy :: Monad m => PyMObj s -> STT s m PyObj
+freezePy PyMNone = pure PyNone
+freezePy (PyMTup o) = PyTup <$> (traverse freezePy o)
+freezePy (PyMRef r) = readSTRef r >>= freezePy'
+freezePy (PyMBool b) = pure (PyBool b)
 
-freezePy' :: Monad m => PyData' s -> STT s m PyIObj
-freezePy' (PyList d) = PyIList <$> (traverse freezePy d)
+freezePy' :: Monad m => PyMData' s -> STT s m PyObj
+freezePy' (PyMList ds) = PyList . reverse <$> (traverse freezePy ds)
+freezePy' (PyMDict ds) = PyDict . reverse <$> (traverse (traverse2 freezePy) ds)
 
 
 class ToPy a where
-  toPy :: a -> PyIObj
+  toPy :: a -> PyObj
 
 
 class TryFromPy a where
-  tryFromPy :: PyIObj -> Either String a
+  tryFromPy :: PyObj -> Failable a
 
 
-instance ToPy PyIObj where
+instance ToPy PyObj where
   toPy = id
 
-instance TryFromPy PyIObj where
+instance TryFromPy PyObj where
   tryFromPy = Right
 
 
-decodeError :: forall a b. (Typeable b, Show a) => a -> Either String b
+decodeError :: forall a b. (Typeable b, Show a) => a -> Failable b
 decodeError v = Left ("Can not decode " ++ show v ++ " to " ++ show (typeOf @b undefined))
 
 instance ToPy Bool where
-  toPy = PyIBool
+  toPy = PyBool
 
 instance TryFromPy Bool where
-  tryFromPy (PyIBool b) = Right b
+  tryFromPy (PyBool b) = Right b
   tryFromPy v = decodeError v
 
 instance (TryFromPy a, Typeable a) => TryFromPy [a] where
-  tryFromPy (PyIList ls) = traverse tryFromPy ls
-  tryFromPy (PyITup ls) = traverse tryFromPy ls
+  tryFromPy (PyList ls) = traverse tryFromPy ls
+  tryFromPy (PyTup ls) = traverse tryFromPy ls
   tryFromPy v = decodeError v
 
 
 instance ToPy a => ToPy (Maybe a) where
-  toPy Nothing = PyINone
+  toPy Nothing = PyNone
   toPy (Just v) = toPy v
 
 instance (TryFromPy a, Typeable a) => TryFromPy (Maybe a) where
-  tryFromPy PyINone = Right Nothing
+  tryFromPy PyNone = Right Nothing
   tryFromPy v = Just <$> tryFromPy v
 
 
 instance ToPy a => ToPy [a] where
-  toPy = PyIList . map toPy
+  toPy = PyList . map toPy
 
 newtype Pickled a = Pickled a
 data PickleState s = PickleState {
-    pickleStack :: NonEmpty [PyObj s]
-  , pickleMemory :: [PyObj s]
+    pickleStack :: Stack s
+  , pickleMemory :: [Mack s]
   }
 
 initialState :: PickleState s
@@ -111,45 +122,66 @@ pushOrInit x = go
   where go [] = [x] :| []
         go (xs:xss) = (x:xs) :| xss
 
-type PickleM s m a = StateT (PickleState s) (STT s m) a
+type PickleT s m a = StateT (PickleState s) m a
+type PickleT' s m = PickleT s m ()
+type PickleM s m a = PickleT s (STT s m) a
+type PickleM' s m = PickleM s m ()
+type Failable a = Either String a
 
-onStack :: (NonEmpty [PyObj s] -> NonEmpty [PyObj s]) -> PickleState s -> PickleState s
+onStack :: (Stack s -> Stack s) -> PickleState s -> PickleState s
 onStack f s@PickleState{ pickleStack=ps } = s {pickleStack=f ps }
 
-modifyOnStack :: Monad m => (NonEmpty [PyObj s] -> NonEmpty [PyObj s]) -> StateT (PickleState s) m ()
+modifyOnStack :: Monad m => (Stack s -> Stack s) -> PickleT' s m
 modifyOnStack = modify . onStack
 
 -- if this can fail
-modifyOnStack' :: MonadFail m => (NonEmpty [PyObj s] -> Either String (NonEmpty [PyObj s])) -> StateT (PickleState s) m ()
+modifyOnStack' :: MonadFail m => (Stack s -> Failable (Stack s)) -> PickleT' s m
 modifyOnStack' f = do
   s@PickleState { pickleStack=ps } <- get
   case f ps of
     Left f -> fail f
     Right r -> put s {pickleStack=r}
 
-modifyOnStackM :: Monad m => (NonEmpty [PyObj s] -> StateT (PickleState s) m (NonEmpty [PyObj s])) -> StateT (PickleState s) m ()
+setStack :: Monad m => PickleState s -> Stack s -> PickleT' s m
+setStack s ps = put s {pickleStack=ps}
+
+getStack :: Monad m => PickleT s m (Stack s)
+getStack = pickleStack <$> get
+
+getStack' :: Monad m => PickleT s m (PickleState s, Stack s)
+getStack' = ap (,) pickleStack <$> get
+
+modifyOnStackM :: Monad m => (Stack s -> PickleT s m (Stack s)) -> PickleT' s m
 modifyOnStackM f = do
+  (s, ps) <- getStack'
+  f ps >>= setStack s
+
+modifyOnStackM' :: MonadFail m => (Stack s -> PickleT s m (Failable (Stack s))) -> PickleT' s m
+modifyOnStackM' f = do
   s@PickleState{pickleStack=ps} <- get
   ps' <- f ps
-  put (s {pickleStack=ps'})
+  case ps' of
+    Left f -> fail f
+    Right r -> put s {pickleStack=r}
 
 
-modifyOnTopFrame :: Monad m => ([PyObj s] -> [PyObj s]) -> PickleM s m ()
+
+modifyOnTopFrame :: Monad m => (Mack s -> Mack s) -> PickleM s m ()
 modifyOnTopFrame f = modifyOnStack (\(x :| xs) -> f x :| xs)
 
 mark :: Monad m => PickleM s m ()
 mark = modifyOnStack ([] <|)  -- push a new "stack frame"
 
-pushStack :: Monad m => PyObj s -> PickleM s m ()
+pushStack :: Monad m => PyMObj s -> PickleM s m ()
 pushStack = modifyOnStack . pushOnFrame
 
-newData :: Monad m => PyData' s -> PickleM s m (PyObj s)
-newData = fmap PyRef . lift . newSTRef
+newData :: Monad m => PyMData' s -> PickleM s m (PyMObj s)
+newData = fmap PyMRef . lift . newSTRef
 
-pushNewStack :: Monad m => PyData' s -> PickleM s m ()
+pushNewStack :: Monad m => PyMData' s -> PickleM s m ()
 pushNewStack d = newData d >>= pushStack
 
-pickleStackUnderflow :: Either String a
+pickleStackUnderflow :: Failable a
 pickleStackUnderflow = Left "unpickling stack underflow"
 
 -- Opcode: '0', '1'
@@ -167,53 +199,69 @@ fromTopMost = fromTopMost' . (. reverse)
 fromTopMost' f (x :| xs) = pushOrInit (f x) xs
 
 fromTopMostM', fromTopMostM :: Monad m => ([a] -> m a) -> NonEmpty [a] -> m (NonEmpty [a])
-fromTopMostM = fromTopMostM . (. reverse)
+fromTopMostM = fromTopMostM' . (. reverse)
 fromTopMostM' f (x :| xs) = (`pushOrInit` xs) <$> f x
+fromTopMostMF', fromTopMostMF :: MonadFail m => ([a] -> m (Failable a)) -> NonEmpty [a] -> m (NonEmpty [a])
+fromTopMostMF = fromTopMostMF' . (. reverse)
+fromTopMostMF' f (x :| xs) = f x >>= either fail (pure . (`pushOrInit` xs))
 
-newFromTopMostM', newFromTopMostM :: Monad m => ([PyObj s] -> PyData' s) -> NonEmpty [PyObj s] -> PickleM s m (NonEmpty [PyObj s])
+newFromTopMostM', newFromTopMostM :: Monad m => (Mack s -> PyMData' s) -> Stack s -> PickleM s m (Stack s)
 newFromTopMostM' = fromTopMostM' . (newData .)
 newFromTopMostM = fromTopMostM . (newData .)
+newFromTopMostMF', newFromTopMostMF :: Monad m => (Mack s -> Failable (PyMData' s)) -> Stack s -> PickleM s m (Failable (Stack s))
+newFromTopMostMF' = fromTopMostMF' . ((sequence . fmap newData) .)
+newFromTopMostMF = fromTopMostMF . ((sequence . fmap newData) .)
 
-fromTopMostStack, fromTopMostStack' :: Monad m => ([PyObj s] -> PyObj s) -> PickleM s m ()
+
+fromTopMostStack, fromTopMostStack' :: Monad m => (Mack s -> PyMObj s) -> PickleM s m ()
 fromTopMostStack = modifyOnStack . fromTopMost
 fromTopMostStack' = modifyOnStack . fromTopMost'
 
-fromTopMostStackM, fromTopMostStackM' :: Monad m => ([PyObj s] -> PickleM s m (PyObj s)) -> PickleM s m ()
+fromTopMostStackM, fromTopMostStackM' :: Monad m => (Mack s -> PickleM s m (PyMObj s)) -> PickleM s m ()
 fromTopMostStackM = modifyOnStackM . fromTopMostM
 fromTopMostStackM' = modifyOnStackM . fromTopMostM'
 
-newFromTopMostStackM, newFromTopMostStackM' :: Monad m => ([PyObj s] -> PyData' s) -> PickleM s m ()
+newFromTopMostStackM, newFromTopMostStackM' :: Monad m => (Mack s -> PyMData' s) -> PickleM s m ()
 newFromTopMostStackM = modifyOnStackM . newFromTopMostM
 newFromTopMostStackM' = modifyOnStackM . newFromTopMostM'
 
+newFromTopMostStackMF, newFromTopMostStackMF' :: Monad m => (Mack s -> Failable (PyMData' s)) -> PickleM s m ()
+newFromTopMostStackMF = undefined
+newFromTopMostStackMF' = modifyOnStackM' . newFromTopMostMF'
+
+
 
 -- Opcode: '.'
-stop :: Monad m => PickleM s m (Maybe PyIObj)
+stop :: Monad m => PickleM s m (Maybe PyObj)
 stop = do
   d <- gets (listToMaybe . NE.head . pickleStack)
   case d of
     Nothing -> pure Nothing
     Just j -> Just <$> lift (freezePy j)
 
-toTups :: [PyObj s] -> Either String [(PyObj s, PyObj s)]
+-- are reversed, since we use dicts in reverse order
+toTups :: [a] -> Failable [(a, a)]
 toTups [] = Right []
-toTups (x1:x2:xs) = ((x1, x2) :) <$> toTups xs
-toTups _ = Left "odd number of items for DICT"
+toTups (x1:x2:xs) = ((x2, x1) :) <$> toTups xs  -- value is first on the stack
+toTups [_] = Left "odd number of items for DICT."
+
+toDict :: Mack s -> Failable (PyMData' s)
+toDict = fmap PyMDict . toTups
 
 -- Opcode: 'N', '}', ')', ']', 'l', 't', '\x85', '\x86', '\x87'
 none, emptyDict, emptyTuple, emptyList, list, tuple, tuple1, tuple2, tuple3, true, false :: Monad m => PickleM s m ()
-none = pushStack PyNone
-emptyDict = pushNewStack (PyDict [])
-emptyTuple = pushStack (PyTup [])
-emptyList = pushNewStack (PyList [])
-list = newFromTopMostStackM' PyList
-tuple = fromTopMostStack PyTup
--- dict = newFromTopMostStackM' (PyDict . toTups)
-tuple1 = modifyOnTopFrame (\(x1:xs) -> PyTup [x1] : xs)
-tuple2 = modifyOnTopFrame (\(x2:x1:xs) -> PyTup [x1, x2] : xs)
-tuple3 = modifyOnTopFrame (\(x3:x2:x1:xs) -> PyTup [x1, x2, x3] : xs)
-true = pushStack (PyBool True)
-false = pushStack (PyBool False)
+none = pushStack PyMNone
+emptyDict = pushNewStack (PyMDict [])
+emptyTuple = pushStack (PyMTup [])
+emptyList = pushNewStack (PyMList [])
+list = newFromTopMostStackM' PyMList
+tuple = fromTopMostStack PyMTup
+dict = newFromTopMostStackM'' toDict
+tuple1 = modifyOnTopFrame (\(x1:xs) -> PyMTup [x1] : xs)
+tuple2 = modifyOnTopFrame (\(x2:x1:xs) -> PyMTup [x1, x2] : xs)
+tuple3 = modifyOnTopFrame (\(x3:x2:x1:xs) -> PyMTup [x1, x2, x3] : xs)
+true = pushStack (PyMBool True)
+false = pushStack (PyMBool False)
 
 -- Opcode: '2'
 dup :: Monad m => PickleM s m ()
@@ -240,14 +288,14 @@ process' 136 = true        -- b'\x88'
 process' 137 = false       -- b'\x89'
 process' _ = undefined
 
-process :: Word8 -> PickleM s Get (Maybe PyIObj)
+process :: Word8 -> PickleM s Get (Maybe PyObj)
 process 46 = stop
 process n = process' n >> parsePickle'  -- handle and continue
 
-parsePickle' :: PickleM s Get (Maybe PyIObj)
+parsePickle' :: PickleM s Get (Maybe PyObj)
 parsePickle' = lift (lift getWord8) >>= process
 
-parsePickle :: Get (Maybe PyIObj)
+parsePickle :: Get (Maybe PyObj)
 parsePickle = runSTT (evalStateT parsePickle' initialState)
 
 
