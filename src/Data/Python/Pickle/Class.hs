@@ -37,14 +37,9 @@ data PyObj
 
 -- Immutable PyMObjects
 data PyMObj s
-  = PyMNone
-  | PyMByte Word8
-  | PyMUShort Word16
-  | PyMInt Int32
-  | PyMStr String
+  = PyObj PyObj -- immutable items
   | PyMTup (Mack s)
   | PyMRef (PyMData s)
-  | PyMBool Bool
   deriving Eq
 
 -- data that should be multable
@@ -63,14 +58,9 @@ type PyKvps s = [PyKvp s]
 type Stack s = NonEmpty (Mack s)
 
 freezePy :: Monad m => PyMObj s -> STT s m PyObj
-freezePy PyMNone = pure PyNone
 freezePy (PyMTup o) = PyTup <$> (traverse freezePy o)
 freezePy (PyMRef r) = readSTRef r >>= freezePy'
-freezePy (PyMByte b) = pure (PyByte b)
-freezePy (PyMUShort u) = pure (PyUShort u)
-freezePy (PyMStr s) = pure (PyStr s)
-freezePy (PyMInt i) = pure (PyInt i)
-freezePy (PyMBool b) = pure (PyBool b)
+freezePy (PyObj o) = pure o
 
 freezePy' :: Monad m => PyMData' s -> STT s m PyObj
 freezePy' (PyMList ds) = PyList . reverse <$> (traverse freezePy ds)
@@ -191,27 +181,36 @@ modifyOnTopFrame f = modifyOnStack (\(x :| xs) -> f x :| xs)
 mark :: Monad m => PickleM s m ()
 mark = modifyOnStack ([] <|)  -- push a new "stack frame"
 
-pushStack :: Monad m => PyMObj s -> PickleM s m ()
-pushStack = modifyOnStack . pushOnFrame
+pushStack' :: Monad m => PyMObj s -> PickleM s m ()
+pushStack' = modifyOnStack . pushOnFrame
+
+pushStack :: Monad m => PyObj -> PickleM s m ()
+pushStack = pushStack' . PyObj
 
 newData :: Monad m => PyMData' s -> PickleM s m (PyMObj s)
 newData = fmap PyMRef . lift . newSTRef
 
 pushNewStack :: Monad m => PyMData' s -> PickleM s m ()
-pushNewStack d = newData d >>= pushStack
+pushNewStack d = newData d >>= pushStack'
 
-pickleStackUnderflow :: Failable a
-pickleStackUnderflow = Left "unpickling stack underflow"
+stackUnderflow :: String
+stackUnderflow = "unpickling stack underflow"
+
+eitherStackUnderflow :: Failable a
+eitherStackUnderflow = Left stackUnderflow
+
+failStackUnderflow :: MonadFail m => m a
+failStackUnderflow = fail stackUnderflow
 
 -- Opcode: '0', '1'
 pop, popMark :: MonadFail m => PickleM s m ()
 pop = modifyOnStack' go
   where go ((_:xs) :| xss) = Right (xs :| xss)
         go ([] :| (xs : xss)) = Right (xs :| xss)
-        go _ = pickleStackUnderflow
+        go _ = eitherStackUnderflow
 popMark = modifyOnStack' go
   where go (_ :| (x : xs)) = Right (x :| xs)
-        go _ = pickleStackUnderflow
+        go _ = eitherStackUnderflow
 
 fromTopMost, fromTopMost' :: ([a] -> a) -> NonEmpty [a] -> NonEmpty [a]
 fromTopMost = fromTopMost' . (. reverse)
@@ -251,12 +250,12 @@ newFromTopMostStackMF' = modifyOnStackM . newFromTopMostMF'
 
 
 -- Opcode: '.'
-stop :: Monad m => PickleM s m (Maybe PyObj)
+stop :: MonadFail m => PickleM s m PyObj
 stop = do
   d <- gets (listToMaybe . NE.head . pickleStack)
   case d of
-    Nothing -> pure Nothing
-    Just j -> Just <$> lift (freezePy j)
+    Nothing -> failStackUnderflow
+    Just j -> lift (freezePy j)
 
 -- are reversed, since we use dicts in reverse order
 toTups :: [a] -> Failable [(a, a)]
@@ -269,9 +268,9 @@ toDict = fmap PyMDict . toTups
 
 -- Opcode: 'N', '}', ')', ']', 'l', 't', '\x85', '\x86', '\x87'
 none, emptyDict, emptyTuple, emptyList, list, tuple, dict, tuple1, tuple2, tuple3, true, false :: MonadFail m => PickleM s m ()
-none = pushStack PyMNone
+none = pushStack PyNone
 emptyDict = pushNewStack (PyMDict [])
-emptyTuple = pushStack (PyMTup [])
+emptyTuple = pushStack' (PyMTup [])
 emptyList = pushNewStack (PyMList [])
 list = newFromTopMostStackM' PyMList
 tuple = fromTopMostStack PyMTup
@@ -279,18 +278,18 @@ dict = newFromTopMostStackMF' toDict
 tuple1 = modifyOnTopFrame (\(x1:xs) -> PyMTup [x1] : xs)
 tuple2 = modifyOnTopFrame (\(x2:x1:xs) -> PyMTup [x1, x2] : xs)
 tuple3 = modifyOnTopFrame (\(x3:x2:x1:xs) -> PyMTup [x1, x2, x3] : xs)
-true = pushStack (PyMBool True)
-false = pushStack (PyMBool False)
+true = pushStack (PyBool True)
+false = pushStack (PyBool False)
 
-pushRead :: (a -> PyMObj s) -> Get a -> PickM' s
+pushRead :: (a -> PyObj) -> Get a -> PickM' s
 pushRead f g = lift (lift g) >>= pushStack . f
 
 -- opcode: 'J', 'K', 'M', '\x8c'
 word32, word8, word16, utf8lenstr :: PickM' s
-word32 = pushRead PyMInt getInt32le
-word8 = pushRead PyMByte getWord8
-word16 = pushRead PyMUShort getWord16le
-utf8lenstr = pushRead (PyMStr . toString) (getWord8 >>= getByteString . fromIntegral)
+word32 = pushRead PyInt getInt32le
+word8 = pushRead PyByte getWord8
+word16 = pushRead PyUShort getWord16le
+utf8lenstr = pushRead (PyStr . toString) (getWord8 >>= getByteString . fromIntegral)
 
 -- Opcode: '2'
 dup :: Monad m => PickleM s m ()
@@ -322,18 +321,18 @@ process' 137 = false       -- b'\x89'
 process' 140 = utf8lenstr  -- b'\x8c'
 process' _ = undefined
 
-process :: Word8 -> PickM s (Maybe PyObj)
+process :: Word8 -> PickM s PyObj
 process 46 = stop
 process n = process' n >> parsePickle''  -- handle and continue
 
-parsePickle'' :: PickM s (Maybe PyObj)
+parsePickle'' :: PickM s PyObj
 parsePickle'' = lift (lift getWord8) >>= process
 
-parsePickle' :: Get (Maybe PyObj)
+parsePickle' :: Get PyObj
 parsePickle' = runSTT (evalStateT parsePickle'' initialState)
 
--- parsePickle :: TryFromPy a => Get a
--- parsePickle = parsePickle' >>= maybe (fail )
+parsePickle :: TryFromPy a => Get a
+parsePickle = parsePickle' >>= orFail pure . tryFromPy
 
 
 assumeG :: Word8 -> Get ()
