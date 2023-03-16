@@ -17,7 +17,8 @@ cabal-version:       >=1.10
 library
   hs-source-dirs:      src
   exposed-modules:
-      Data.Python.Pickle
+      Data.Python.Literals
+    , Data.Python.Pickle
     , Data.Python.Pickle.Class
   build-depends:
       base >= 4.7 && < 5

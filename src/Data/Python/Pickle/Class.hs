@@ -2,29 +2,31 @@
 
 module Data.Python.Pickle.Class where
 
-import Control.Applicative(liftA2)
-import Control.Monad((=<<), ap)
+import Control.Applicative((<|>), liftA2)
+import Control.Monad((>=>), ap)
 import Control.Monad.ST.Trans(STT, newSTRef, readSTRef, runSTT)
 import Control.Monad.Trans.Class(MonadTrans, lift)
 import Control.Monad.Trans.State.Strict(StateT, evalStateT, get, gets, modify, put)
 
 import Data.Binary(Get, Put, getWord8, putWord8)
 import Data.Binary.Get(getByteString, getWord16le, getInt32le)
+import Data.Bool(bool)
 import Data.ByteString.UTF8(toString)
 import Data.Either(either)
-import Data.Int(Int32)
+import Data.Int(Int8, Int16, Int32, Int64)
 import Data.List.NonEmpty(NonEmpty((:|)), (<|))
 import qualified Data.List.NonEmpty as NE
 import Data.Maybe(listToMaybe)
 import Data.STRef(STRef)
 import Data.Typeable(Typeable, typeOf)
-import Data.Word(Word8, Word16)
+import Data.Word(Word8, Word16, Word32, Word64)
 
 traverse2 :: Applicative f => (a -> f b) -> (a, a) -> f (b, b)
 traverse2 f (x1, x2) = liftA2 (,) (f x1) (f x2)
 
 data PyObj
   = PyNone
+  | PyInteger Integer
   | PyInt Int32
   | PyByte Word8
   | PyUShort Word16
@@ -66,12 +68,19 @@ freezePy' :: Monad m => PyMData' s -> STT s m PyObj
 freezePy' (PyMList ds) = PyList . reverse <$> (traverse freezePy ds)
 freezePy' (PyMDict ds) = PyDict . reverse <$> (traverse (traverse2 freezePy) ds)
 
+boundedIntegral :: forall a . (Bounded a, Integral a, Typeable a) => Integer -> Failable a
+boundedIntegral v
+  | fromIntegral (minBound @a) <= v && v <= fromIntegral (maxBound @a) = Right (fromInteger v)
+  | otherwise = Left ("The value " ++ show v ++ " can not be converted to a " ++ show (typeOf @a undefined))
+
+convertBoundedIntegrals :: (Bounded a, Integral a, Typeable a) => PyObj -> Failable a
+convertBoundedIntegrals = tryFromPy >=> boundedIntegral
 
 class ToPy a where
   toPy :: a -> PyObj
 
 
-class TryFromPy a where
+class ToPy a => TryFromPy a where
   tryFromPy :: PyObj -> Failable a
 
 
@@ -97,18 +106,66 @@ instance (TryFromPy a, Typeable a) => TryFromPy [a] where
   tryFromPy (PyTup ls) = traverse tryFromPy ls
   tryFromPy v = decodeError v
 
+instance ToPy Integer where
+  toPy = PyInteger
+
+instance TryFromPy Integer where
+  tryFromPy (PyInteger i) = Right i
+  tryFromPy (PyInt i) = Right (fromIntegral i)
+  tryFromPy (PyByte i) = Right (fromIntegral i)
+  tryFromPy (PyUShort i) = Right (fromIntegral i)
+  tryFromPy (PyBool b) = Right (bool 0 1 b)
+  tryFromPy v = Left ("Can not convert " ++ show v ++ " to an integral type.")
+
 
 instance ToPy a => ToPy (Maybe a) where
   toPy Nothing = PyNone
   toPy (Just v) = toPy v
 
+instance (ToPy a, ToPy b) => ToPy (Either a b) where
+  toPy (Left l) = toPy l
+  toPy (Right r) = toPy r
+
 instance TryFromPy a => TryFromPy (Maybe a) where
   tryFromPy PyNone = Right Nothing
   tryFromPy v = Just <$> tryFromPy v
 
+instance (TryFromPy a, TryFromPy b) => TryFromPy (Either a b) where
+  tryFromPy v = Left <$> tryFromPy v <|> Right <$> tryFromPy v
 
 instance ToPy a => ToPy [a] where
   toPy = PyList . map toPy
+
+instance ToPy Int where
+  toPy = PyInt . fromIntegral
+
+instance TryFromPy Int where
+  tryFromPy = convertBoundedIntegrals
+
+instance ToPy Int8 where
+  toPy = PyInt . fromIntegral
+
+instance TryFromPy Int8 where
+  tryFromPy = convertBoundedIntegrals
+
+instance ToPy Int16 where
+  toPy = PyInt . fromIntegral
+
+instance TryFromPy Int16 where
+  tryFromPy = convertBoundedIntegrals
+
+instance ToPy Int32 where
+  toPy = PyInt
+
+instance TryFromPy Int32 where
+  tryFromPy = convertBoundedIntegrals
+
+instance ToPy Int64 where
+  toPy = PyInteger . fromIntegral
+
+instance TryFromPy Int64 where
+  tryFromPy = convertBoundedIntegrals
+
 
 newtype Pickled a = Pickled a
 data PickleState s = PickleState {
@@ -169,6 +226,12 @@ modifyOnStackM f = do
   (s, ps) <- getStack'
   f ps >>= setStack s
 
+modifyOnStackF :: MonadFail m => (Stack s -> Failable (Stack s)) -> PickleT' s m
+modifyOnStackF f = do
+  (s, ps) <- getStack'
+  orFail (setStack s) (f ps)
+
+
 modifyOnStackM' :: MonadFail m => (Stack s -> PickleT s m (Failable (Stack s))) -> PickleT' s m
 modifyOnStackM' f = do
   s@PickleState{pickleStack=ps} <- get
@@ -177,6 +240,9 @@ modifyOnStackM' f = do
 
 modifyOnTopFrame :: Monad m => (Mack s -> Mack s) -> PickleM s m ()
 modifyOnTopFrame f = modifyOnStack (\(x :| xs) -> f x :| xs)
+
+modifyOnTopFrameF :: MonadFail m => (Mack s -> Failable (Mack s)) -> PickleM s m ()
+modifyOnTopFrameF f = modifyOnStackF (\(x :| xs) -> (:| xs) <$> f x)
 
 mark :: Monad m => PickleM s m ()
 mark = modifyOnStack ([] <|)  -- push a new "stack frame"
@@ -266,6 +332,14 @@ toTups [_] = Left "odd number of items for DICT."
 toDict :: Mack s -> Failable (PyMData' s)
 toDict = fmap PyMDict . toTups
 
+_toTup1, _toTup2, _toTup3 :: Mack s -> Failable (Mack s)
+_toTup1 (x1:xs) = Right (PyMTup [x1]:xs)
+_toTup1 _ = eitherStackUnderflow
+_toTup2 (x1:x2:xs) = Right (PyMTup [x1,x2]:xs)
+_toTup2 _ = eitherStackUnderflow
+_toTup3 (x1:x2:x3:xs) = Right (PyMTup [x1,x2,x3]:xs)
+_toTup3 _ = eitherStackUnderflow
+
 -- Opcode: 'N', '}', ')', ']', 'l', 't', '\x85', '\x86', '\x87'
 none, emptyDict, emptyTuple, emptyList, list, tuple, dict, tuple1, tuple2, tuple3, true, false :: MonadFail m => PickleM s m ()
 none = pushStack PyNone
@@ -275,9 +349,9 @@ emptyList = pushNewStack (PyMList [])
 list = newFromTopMostStackM' PyMList
 tuple = fromTopMostStack PyMTup
 dict = newFromTopMostStackMF' toDict
-tuple1 = modifyOnTopFrame (\(x1:xs) -> PyMTup [x1] : xs)
-tuple2 = modifyOnTopFrame (\(x2:x1:xs) -> PyMTup [x1, x2] : xs)
-tuple3 = modifyOnTopFrame (\(x3:x2:x1:xs) -> PyMTup [x1, x2, x3] : xs)
+tuple1 = modifyOnTopFrameF _toTup1
+tuple2 = modifyOnTopFrameF _toTup2
+tuple3 = modifyOnTopFrameF _toTup3
 true = pushStack (PyBool True)
 false = pushStack (PyBool False)
 
@@ -319,7 +393,7 @@ process' 135 = tuple3      -- b'\x87'
 process' 136 = true        -- b'\x88'
 process' 137 = false       -- b'\x89'
 process' 140 = utf8lenstr  -- b'\x8c'
-process' _ = undefined
+process' n = fail ("invalid load key, " ++ show n ++ ".")
 
 process :: Word8 -> PickM s PyObj
 process 46 = stop
