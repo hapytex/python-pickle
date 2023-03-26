@@ -1,4 +1,4 @@
-{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE BangPatterns, TupleSections #-}
 
 module Data.Python.Literals where
 
@@ -14,20 +14,24 @@ optUnderscore = do
     95 -> getWord8  -- we skip only once
     n -> pure n
 
+readDigit' :: Word8 -> Get Word8
+readDigit' 10 = pure 255
+readDigit' n | 48 <= n && n <= 57 = pure (n-48)
+             | 65 <= n && n <= 70 = pure (n-55)
+             | 97 <= n && n <= 102 = pure (n-87)
+             | otherwise = fail "Expecting a digit."
+
 getDigit' :: Get Word8
-getDigit' = do
-  w <- optUnderscore
-  case w of
-    10 -> pure 255
-    n | 48 <= n && n <= 57 -> pure (n-48)
-      | 65 <= n && n <= 70 -> pure (n-55)
-      | 97 <= n && n <= 102 -> pure (n-87)
-      | otherwise -> fail "Expecting a digit."
+getDigit' = optUnderscore >>= readDigit'
+
+readDigit :: Word8 -> Word8 -> Get Word8
+readDigit mx = go
+  where go 255 = pure 255
+        go d | d < mx = pure d
+             | otherwise = fail "Expected a digit"
 
 getDigit :: Word8 -> Get Word8
-getDigit mx = do
-  d <- getDigit'
-  if d < mx || d == 255 then pure d else fail "Expected a digit."
+getDigit mx = getDigit' >>= readDigit mx
 
 parseNum' :: Word8 -> Integer -> Get Integer
 parseNum' rdx = go
@@ -58,12 +62,18 @@ withMode 111 = parseNum  8  -- 'o'
 withMode 120 = parseNum 16  -- 'x'
 withMode _ = fail "Invalid integer literal."
 
--- TODO: negative
--- TODO: decimal digits always start with nonzero number
+getSign :: Get (Integer -> Integer, Word8)
+getSign = getWord8 >>= go
+  where go 43 = go' (id,)  -- '+'
+        go 45 = go' (negate,) -- '-'
+        go d = (id,) <$> (readDigit 10 d >>= readDigit 10)
+        go' = (`fmap` getDigit 10)
+
+-- decimal digits always start with nonzero number
 intParser :: Get Integer
 intParser = do
-  w <- getDigit 10
-  case w of
+  ~(s, w) <- getSign
+  s <$> case w of
     255 -> fail "Empty integer"
     0 -> getWord8 >>= withMode
     _ -> parseNum' 10 (fromIntegral w)
