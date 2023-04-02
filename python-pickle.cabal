@@ -20,6 +20,7 @@ library
       Data.Python.Literals
     , Data.Python.Pickle
     , Data.Python.Pickle.Class
+    , Data.Python.Pickle.Core
   build-depends:
       base >= 4.7 && < 5
     , binary >=0.2

@@ -77,6 +77,3 @@ intParser = do
     255 -> fail "Empty integer"
     0 -> getWord8 >>= withMode
     _ -> parseNum' 10 (fromIntegral w)
-
-decIntParser :: Integer -> Get Integer
-decIntParser = undefined
