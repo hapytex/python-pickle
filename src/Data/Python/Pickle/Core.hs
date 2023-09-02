@@ -1,22 +1,20 @@
 module Data.Python.Pickle.Core where
 
 import Control.Applicative(liftA2)
-import Control.Monad((>=>), ap)
+import Control.Monad(ap)
 import Control.Monad.ST.Trans(STT, newSTRef, readSTRef, runSTT)
-import Control.Monad.Trans.Class(MonadTrans, lift)
+import Control.Monad.Trans.Class(lift)
 import Control.Monad.Trans.State.Strict(StateT, evalStateT, get, gets, modify, put)
 
 import Data.Binary(Get, Put, getWord8, putWord8)
 import Data.Binary.Get(getByteString, getWord16le, getInt32le)
-import Data.Bool(bool)
 import Data.ByteString.UTF8(toString)
-import Data.Either(either)
-import Data.Int(Int8, Int16, Int32, Int64)
+import Data.Int(Int32)
 import Data.List.NonEmpty(NonEmpty((:|)), (<|))
 import qualified Data.List.NonEmpty as NE
 import Data.Maybe(listToMaybe)
 import Data.STRef(STRef)
-import Data.Word(Word8, Word16, Word32, Word64)
+import Data.Word(Word8, Word16)
 
 import Data.Python.Literals(intParser)
 
@@ -217,11 +215,7 @@ newFromTopMostStackMF' = modifyOnStackM . newFromTopMostMF'
 
 -- Opcode: '.'
 stop :: MonadFail m => PickleM s m PyObj
-stop = do
-  d <- gets (listToMaybe . NE.head . pickleStack)
-  case d of
-    Nothing -> failStackUnderflow
-    Just j -> lift (freezePy j)
+stop = gets (listToMaybe . NE.head . pickleStack) >>= maybe failStackUnderflow (lift . freezePy)
 
 -- are reversed, since we use dicts in reverse order
 toTups :: [a] -> Failable [(a, a)]
@@ -272,27 +266,37 @@ dup = modifyOnStack go
         go ((x:xs) :| xss) = (x : x : xs) :| xss
 
 
+setItem :: Monad m => PickleM s m ()
+setItem = undefined   -- TODO: non-dict?
+
+setItems :: Monad m => PickleM s m ()
+setItems = undefined  -- TODO: non-dict?
+
+
 process' :: Word8 -> PickM' s
-process'  40 = mark        -- b'('
-process'  41 = emptyTuple  -- b')'
-process'  48 = pop         -- b'0'
-process'  49 = popMark     -- b'1'
-process'  50 = dup         -- b'2'
-process'  74 = word32      -- b'J'
-process'  75 = word8       -- b'K'
-process'  77 = word16      -- b'M'
-process'  78 = none        -- b'N'
-process'  93 = emptyList   -- b']'
-process' 100 = dict        -- b'd'
-process' 108 = list        -- b'l'
-process' 116 = tuple       -- b't'
-process' 125 = emptyDict   -- b'}'
-process' 133 = tuple1      -- b'\x85'
-process' 134 = tuple2      -- b'\x86'
-process' 135 = tuple3      -- b'\x87'
-process' 136 = true        -- b'\x88'
-process' 137 = false       -- b'\x89'
-process' 140 = utf8lenstr  -- b'\x8c'
+process'  40 = mark                            -- b'('
+process'  41 = emptyTuple                      -- b')'
+process'  48 = pop                             -- b'0'
+process'  49 = popMark                         -- b'1'
+process'  50 = dup                             -- b'2'
+process'  73 = pushRead PyInteger intParser    -- b'I'  TODO: 01/00 = True/False
+process'  74 = word32                          -- b'J'
+process'  75 = word8                           -- b'K'
+process'  77 = word16                          -- b'M'
+process'  78 = none                            -- b'N'
+process'  93 = emptyList                       -- b']'
+process' 100 = dict                            -- b'd'
+process' 108 = list                            -- b'l'
+process' 115 = setItem                         -- b's'
+process' 116 = tuple                           -- b't'
+process' 117 = setItems                        -- b'u'
+process' 125 = emptyDict                       -- b'}'
+process' 133 = tuple1                          -- b'\x85'
+process' 134 = tuple2                          -- b'\x86'
+process' 135 = tuple3                          -- b'\x87'
+process' 136 = true                            -- b'\x88'
+process' 137 = false                           -- b'\x89'
+process' 140 = utf8lenstr                      -- b'\x8c'
 process' n = fail ("invalid load key, " ++ show n ++ ".")
 
 process :: Word8 -> PickM s PyObj
