@@ -6,8 +6,10 @@ import Control.Monad.ST.Trans(STT, newSTRef, readSTRef, runSTT)
 import Control.Monad.Trans.Class(lift)
 import Control.Monad.Trans.State.Strict(StateT, evalStateT, get, gets, modify, put)
 
+import Debug.Trace(traceShow)
+
 import Data.Binary(Get, Put, getWord8, putWord8)
-import Data.Binary.Get(getByteString, getWord16le, getInt32le)
+import Data.Binary.Get(getByteString, getWord16le, getInt32le, getWord64le, getDoublebe)
 import Data.ByteString.UTF8(toString)
 import Data.Int(Int32)
 import Data.List.NonEmpty(NonEmpty((:|)), (<|))
@@ -16,6 +18,7 @@ import Data.Maybe(listToMaybe)
 import Data.STRef(STRef)
 import Data.Word(Word8, Word16)
 
+import Data.Python.Pickle.Failable(Failable, FailableWith, orFail, orFailWith)
 import Data.Python.Literals(intParser)
 
 
@@ -25,6 +28,7 @@ traverse2 f (x1, x2) = liftA2 (,) (f x1) (f x2)
 data PyObj
   = PyNone
   | PyInteger Integer
+  | PyDouble Double
   | PyInt Int32
   | PyByte Word8
   | PyUShort Word16
@@ -88,12 +92,7 @@ type PickleM s m a = PickleT s (STT s m) a
 type PickleM' s m = PickleM s m ()
 type PickM s a = PickleM s Get a
 type PickM' s = PickM s ()
-type Failable a = Either String a
 
-orFail :: MonadFail m => (a -> m b) -> Failable a -> m b
-orFail f = go
-  where go (Left l) = fail l
-        go (Right r) = f r
 
 onStack :: (Stack s -> Stack s) -> PickleState s -> PickleState s
 onStack f s@PickleState{ pickleStack=ps } = s {pickleStack=f ps }
@@ -109,6 +108,12 @@ modifyOnStack' :: MonadFail m => (Stack s -> Failable (Stack s)) -> PickleT' s m
 modifyOnStack' f = do
   s@PickleState { pickleStack=ps } <- get
   orFail (putStack s) (f ps)
+
+modifyOnStackWith' :: MonadFail m => (Stack s -> Failable (a, Stack s)) -> PickleT s m a
+modifyOnStackWith' f = do
+  s@PickleState { pickleStack=ps } <- get
+  orFailWith (putStack s) (f ps)
+
 
 setStack :: Monad m => PickleState s -> Stack s -> PickleT' s m
 setStack s ps = put s {pickleStack=ps}
@@ -166,15 +171,19 @@ eitherStackUnderflow = Left stackUnderflow
 failStackUnderflow :: MonadFail m => m a
 failStackUnderflow = fail stackUnderflow
 
+popMark' :: MonadFail m => PickleM s m [PyMObj s]
+popMark' = modifyOnStackWith' go
+  where go (y :| (x : xs)) = Right (y, (x :| xs))
+        go _ = eitherStackUnderflow
+
+
 -- Opcode: '0', '1'
 pop, popMark :: MonadFail m => PickleM s m ()
 pop = modifyOnStack' go
   where go ((_:xs) :| xss) = Right (xs :| xss)
         go ([] :| (xs : xss)) = Right (xs :| xss)
         go _ = eitherStackUnderflow
-popMark = modifyOnStack' go
-  where go (_ :| (x : xs)) = Right (x :| xs)
-        go _ = eitherStackUnderflow
+popMark = () <$ popMark'
 
 fromTopMost, fromTopMost' :: ([a] -> a) -> NonEmpty [a] -> NonEmpty [a]
 fromTopMost = fromTopMost' . (. reverse)
@@ -259,6 +268,11 @@ word8 = pushRead PyByte getWord8
 word16 = pushRead PyUShort getWord16le
 utf8lenstr = pushRead (PyStr . toString) (getWord8 >>= getByteString . fromIntegral)
 
+appends :: MonadFail m => PickleM s m ()
+appends = do
+  xs <- popMark'
+  pushNewStack (PyMList xs)
+
 -- Opcode: '2'
 dup :: Monad m => PickleM s m ()
 dup = modifyOnStack go
@@ -275,33 +289,42 @@ setItems = undefined  -- TODO: non-dict?
 
 process' :: Word8 -> PickM' s
 process'  40 = mark                            -- b'('
-process'  41 = emptyTuple                      -- b')'
+                                               -- b'.'  (stop, not used here)
 process'  48 = pop                             -- b'0'
 process'  49 = popMark                         -- b'1'
 process'  50 = dup                             -- b'2'
+-- process'  70 = float                           -- b'F'
 process'  73 = pushRead PyInteger intParser    -- b'I'  TODO: 01/00 = True/False
 process'  74 = word32                          -- b'J'
 process'  75 = word8                           -- b'K'
+process'  76 = pushRead PyInteger intParser    -- b'L'  TODO: omit L as optional (!) prefix
 process'  77 = word16                          -- b'M'
 process'  78 = none                            -- b'N'
+
 process'  93 = emptyList                       -- b']'
 process' 100 = dict                            -- b'd'
+process' 101 = appends                         -- b'e'
 process' 108 = list                            -- b'l'
 process' 115 = setItem                         -- b's'
 process' 116 = tuple                           -- b't'
+process'  41 = emptyTuple                      -- b')'
 process' 117 = setItems                        -- b'u'
+process'  71 = pushRead PyDouble getDoublebe   -- b'G'  parse 64-bit floating point number
 process' 125 = emptyDict                       -- b'}'
+process' 128 = lift (lift (() <$ getWord8))
 process' 133 = tuple1                          -- b'\x85'
 process' 134 = tuple2                          -- b'\x86'
 process' 135 = tuple3                          -- b'\x87'
 process' 136 = true                            -- b'\x88'
 process' 137 = false                           -- b'\x89'
 process' 140 = utf8lenstr                      -- b'\x8c'
+process' 148 = lift (lift (pure ()))
+process' 149 = lift (lift (() <$ getWord64le))
 process' n = fail ("invalid load key, " ++ show n ++ ".")
 
 process :: Word8 -> PickM s PyObj
 process 46 = stop
-process n = process' n >> parsePickle''  -- handle and continue
+process n = traceShow n (process' n >> parsePickle'')  -- handle and continue
 
 parsePickle'' :: PickM s PyObj
 parsePickle'' = lift (lift getWord8) >>= process

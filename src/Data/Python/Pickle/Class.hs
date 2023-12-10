@@ -12,10 +12,10 @@ import Data.Typeable(Typeable, typeOf)
 import Data.Word(Word8, Word16, Word32, Word64)
 
 import Data.Python.Pickle.Core(
-    Failable
-  , PyObj(PyBool, PyByte, PyInt, PyInteger, PyList, PyNone, PyTup, PyUShort)
-  , orFail, parsePickle'
+    PyObj(PyBool, PyByte, PyInt, PyInteger, PyList, PyNone, PyTup, PyUShort)
+  , parsePickle'
   )
+import Data.Python.Pickle.Failable(Failable, orFail)
 
 boundedIntegral :: forall a . (Bounded a, Integral a, Typeable a) => Integer -> Failable a
 boundedIntegral v
@@ -137,7 +137,7 @@ assumeG w = do
 parsePickle :: TryFromPy a => Get a
 parsePickle = parsePickle' >>= orFail pure . tryFromPy
 
-newtype Pickled a = Pickled a
+newtype Pickled a = Pickled { unpickle :: a}
 
 instance TryFromPy a => Binary (Pickled a) where
   get = Pickled <$> parsePickle
