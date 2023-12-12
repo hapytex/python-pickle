@@ -11,9 +11,9 @@ import Data.Int(Int8, Int16, Int32, Int64)
 import Data.Typeable(Typeable, typeOf)
 import Data.Word(Word8, Word16, Word32, Word64)
 
-import Data.Python.Pickle.Core(
+import Data.Python.Pickle.Core(parsePickle')
+import Data.Python.Pickle.Object(
     PyObj(PyBool, PyByte, PyInt, PyInteger, PyList, PyNone, PyTup, PyUShort)
-  , parsePickle'
   )
 import Data.Python.Pickle.Failable(Failable, orFail)
 
