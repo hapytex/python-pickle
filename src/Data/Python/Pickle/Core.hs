@@ -237,6 +237,9 @@ appends = do
 memoize :: MonadFail m => PickleM s m ()
 memoize = peek >>= modifyOnMemo . memoizeItem
 
+binput :: (Integral i, MonadFail m) => i -> PickleM s m ()
+binput i = peek >>= modifyOnMemo . putItem i
+
 binget :: (Integral i, MonadFail m) => i -> PickleM s m ()
 binget i = getMemo >>= pushStack' . (! fromIntegral i)
 
@@ -274,6 +277,8 @@ process' 101 = appends                         -- b'e'
 process' 103 = lift (lift getWord8) >>= binget -- b'h'
 process' 105 = lift (lift getWord32le) >>= binget  -- b'j'
 process' 108 = list                            -- b'l'
+process' 113 = lift (lift getWord8) >>= binput -- 'q'
+process' 113 = lift (lift getWord32le) >>= binput -- 'q'
 process' 115 = setItem                         -- b's'
 process' 116 = tuple                           -- b't'
 process'  41 = emptyTuple                      -- b')'
